@@ -63,7 +63,7 @@ API_KEY = ""
 # لو التطبيق شغال على سيرفر (Render / Railway / ...) السيرفر بيحدد البورت لوحده،
 # وساعتها مش محتاجين نفق Cloudflare ولا اللاب يكون شغال.
 IS_CLOUD = bool(os.environ.get("PORT")) or os.environ.get("RUN_ON_SERVER") == "1"
-PORT = int(os.environ.get("PORT", 5000))
+PORT = int(os.environ.get("PORT", 5050))
 KNOWN_PEOPLE = door_file.person          # من door.py
 AC_ON_TEMP = ac_file.ON_TEMP             # من air_conditioner.py
 FIRE_TEMP = fire_file.TEMP_LIMIT         # من fire_alarm.py

@@ -859,4 +859,4 @@ else:
         print(f"النفق ما اشتغلش: {ex}")
     print("استني ثواني لحد ما يظهر اللينك العام (🌍) تحت...")
     print("=" * 50)
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=PORT)
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER)

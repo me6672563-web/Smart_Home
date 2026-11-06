@@ -1,4 +1,2 @@
-streamlit
-pandas
-requests
-flet
+flask
+anthropic

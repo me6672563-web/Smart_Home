@@ -1,52 +1,21 @@
 """
-Smart Home + AI Assistant (v4) - الواجهة الجديدة (كروت ملونة)
-بيشتغل على سيرفر أونلاين (Render مثلاً) من أي نت (داتا / واي فاي تاني) من غير ما اللاب يكون شغال.
-وبيشتغل كمان على اللاب عن طريق Cloudflare Tunnel.
-والشات بيشتغل من غير API Key بمساعد محلي، ولو حطيتي مفتاح بيستخدم الـ AI.
-
-الملفات اللي لازم تكون في نفس الفولدر مع app.py (ملفاتك أنتِ، والتطبيق بيستدعيها):
-  air_conditioner.py  door.py  fire_alarm.py  TV.py  wash_machine.py  lights.py  Security.py  ai_assistant.py
-
-التشغيل:
-  python app.py
+Smart Home + AI Assistant - نسخة Flask لـ PythonAnywhere (نفس منطق app.py ونفس ملفاتك).
+الملفات اللي لازم تكون جنب الملف ده: air_conditioner.py door.py fire_alarm.py TV.py
+wash_machine.py lights.py Security.py ai_assistant.py
 """
 
 import json
 import os
-import socket
-import subprocess
 import sys
-import threading
 from datetime import datetime, timedelta
 
+from flask import Flask, jsonify, request, Response
 
-def _ensure(import_name, pip_name):
-    try:
-        __import__(import_name)
-    except ImportError:
-        print(f"بيتثبت {pip_name} ... استني لحظات")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+try:
+    import anthropic
+except ImportError:
+    anthropic = None
 
-
-def _fix_fastapi():
-    try:
-        from importlib.metadata import version
-        major_minor = tuple(int(x) for x in version("fastapi").split(".")[:2])
-        if major_minor >= (0, 145):
-            print("بيتظبط نسخة FastAPI ... استني لحظات")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "fastapi<0.145"])
-    except Exception:
-        pass
-
-
-_ensure("flet", "flet==0.28.3")
-_ensure("anthropic", "anthropic")
-_fix_fastapi()
-
-import flet as ft
-import anthropic
-
-# ---------------- ملفاتك أنتِ (التطبيق بيستدعيها، مش كاتب منطقها من جديد) ----------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import air_conditioner as ac_file
 import door as door_file
@@ -289,574 +258,311 @@ def local_assistant(text):
             "• حد دخل البيت امتى؟")
 
 
-# ---------------- ألوان الواجهة ----------------
-BG = "#030308"
-CYAN = "#22D3EE"
-C_WASH = "#0099FF"
-C_LIGHTS = "#E6B800"
-C_SECURITY = "#00CC44"
-C_AC = "#00B3B3"
-C_DOOR = "#E65C00"
-C_TV = "#9900CC"
-C_FIRE = "#CC0029"
-C_AI = "#4B0082"
+# ================= Flask =================
+app = Flask(__name__)
+client_holder = {"client": None}
+histories = {}
+pending = []                      # تنبيهات (حريق / كاميرا) بتتبعت للصفحة
+hooks["alert"] = pending.append
+load_events()
 
 
-def build_app(page: ft.Page):
-    page.title = "Smart Home Intelligent Home Control"
-    page.rtl = False
-    page.bgcolor = BG
-    page.theme_mode = ft.ThemeMode.DARK
-    page.padding = 16
-    page.scroll = ft.ScrollMode.AUTO
-    page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
+def set_key(k):
+    if anthropic and k:
+        client_holder["client"] = anthropic.Anthropic(api_key=k)
 
-    client_holder = {"client": None}
-    history = []
 
-    if not events:
-        load_events()
+set_key(API_KEY.strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip())
 
-    # ---------- أدوات مساعدة ----------
-    def snack(msg, color=None):
-        page.open(ft.SnackBar(ft.Text(msg), bgcolor=color))
 
-    def show_dialog(title, content, buttons):
-        dlg = ft.AlertDialog(modal=True, title=ft.Text(title), content=content)
+def apply_fire():
+    set_state(FIRE, fire_file.is_on("yes" if env["smoke"] else "no", env["temp"]), source="حساس")
 
-        def wrap(cb):
-            def handler(e):
-                page.close(dlg)
-                if cb:
-                    cb()
-            return handler
 
-        dlg.actions = [ft.TextButton(label, on_click=wrap(cb)) for label, cb in buttons]
-        page.open(dlg)
+def apply_climate():
+    """بترجع True لو التكييف اشتغل لوحده (الصفحة تسأل عن الدرجة)."""
+    if ac_file.decide(env["person"], env["temp"]) == "ON":
+        if not devices[AC]["on"]:
+            set_state(AC, True, source="تلقائي")
+            return True
+    elif devices[AC]["on"]:
+        set_state(AC, False, source="تلقائي")
+    return False
 
-    # ---------- مفتاح الـ API ----------
-    key_field = ft.TextField(label="Anthropic API Key", password=True, can_reveal_password=True)
 
-    def set_key(key):
-        client_holder["client"] = anthropic.Anthropic(api_key=key)
+def snapshot(**extra):
+    alerts = pending[:]
+    del pending[:]
+    n = sum(1 for l in LIGHTS if devices[l]["on"])
+    d = {"tiles": {"wash": state_text(WASHER), "lights": f"{n}/{len(LIGHTS)} شغال",
+                   "security": "📷 " + state_text(CAMERA), "ac": state_text(AC),
+                   "door": state_text(DOOR), "tv": state_text(TV), "fire": state_text(FIRE)},
+         "on": {"wash": devices[WASHER]["on"], "ac": devices[AC]["on"],
+                "door": devices[DOOR]["on"], "tv": devices[TV]["on"]},
+         "cam": devices[CAMERA]["on"], "fire": devices[FIRE]["on"],
+         "lights": {l: devices[l]["on"] for l in LIGHTS},
+         "ac_value": devices[AC]["value"], "env": env, "alerts": alerts}
+    d.update(extra)
+    return jsonify(d)
 
-    def save_key():
-        key = key_field.value.strip()
-        if key:
-            try:
-                page.client_storage.set("api_key", key)
-            except Exception:
-                pass
-            set_key(key)
 
-    def open_settings(e=None):
-        show_dialog("إعدادات الـ AI", key_field, [("حفظ", save_key)])
+def a_wash_off(d): set_state(WASHER, False, source="يدوي")
 
-    # ---------- السجل ----------
-    def show_log(e=None):
-        lv = ft.ListView(spacing=6, height=380, width=300)
-        if not events:
-            lv.controls.append(ft.Text("السجل فاضي لسه"))
-        for ev in reversed(events[-60:]):
-            icon = {"entry": "🚪", "fire_alarm": "🔥", "motion": "🏃", "security": "🔐"}.get(ev["kind"], "🔧")
-            lv.controls.append(ft.Text(
-                f"{icon} {ev['time']}\n{ev['device']}: {ev['detail']}  ({ev['source']})", size=13))
-        show_dialog("سجل أحداث البيت", lv, [("إغلاق", None)])
 
-    # ---------- الكروت ----------
-    tiles = {}  # key -> (container, subtitle_text)
+def a_wash_on(d):
+    t = d.get("type", "normal")
+    res = wash_file.start("yes", t)
+    set_state(WASHER, True, t, source="يدوي")
+    return {"msg": " - ".join(res["messages"])}
 
-    def status_for(key):
-        if key == "wash":
-            return state_text(WASHER)
-        if key == "lights":
-            n = sum(1 for l in LIGHTS if devices[l]["on"])
-            return f"{n}/{len(LIGHTS)} شغال"
-        if key == "security":
-            return "📷 " + state_text(CAMERA)
-        if key == "ac":
-            return state_text(AC)
-        if key == "door":
-            return state_text(DOOR)
-        if key == "tv":
-            return state_text(TV)
-        if key == "fire":
-            return state_text(FIRE)
-        return ""
 
-    def refresh_ui():
-        for key, (box, sub) in tiles.items():
-            if key == "ai":
-                continue
-            sub.value = status_for(key)
-        # تحذيرات بصرية
-        sec_box = tiles["security"][0]
-        sec_box.bgcolor = C_SECURITY if devices[CAMERA]["on"] else "#E65100"
-        fire_box = tiles["fire"][0]
-        fire_box.border = ft.border.all(3, "white") if devices[FIRE]["on"] else None
-        page.update()
+def a_light(d): set_state(d["name"], bool(d["on"]), source="يدوي")
 
-    def make_tile(key, label, icon, color, on_click, height=120, wide=False):
-        sub = ft.Text("", size=11, color="#FFFFFFCC", text_align=ft.TextAlign.CENTER)
-        if wide:
-            content = ft.Row(
-                [ft.Icon(icon, size=44, color="white"),
-                 ft.Column([ft.Text(label, size=20, weight=ft.FontWeight.BOLD, color="white"), sub],
-                           spacing=0, tight=True)],
-                alignment=ft.MainAxisAlignment.CENTER, spacing=18)
-        else:
-            content = ft.Column(
-                [ft.Icon(icon, size=44, color="white"),
-                 ft.Text(label, size=13, weight=ft.FontWeight.BOLD, color="white",
-                         text_align=ft.TextAlign.CENTER),
-                 sub],
-                alignment=ft.MainAxisAlignment.CENTER,
-                horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=4)
-        box = ft.Container(content=content, height=height, bgcolor=color, border_radius=26,
-                           alignment=ft.alignment.center, ink=True,
-                           on_click=lambda e: on_click(), expand=True)
-        tiles[key] = (box, sub)
-        return box
 
-    # ---------- التكييف ----------
-    def ask_ac_temp():
-        f = ft.TextField(label="الدرجة الجديدة", keyboard_type=ft.KeyboardType.NUMBER,
-                         value=str(devices[AC]["value"]))
+def a_sec(d):
+    res = security_file.check(d.get("pw", ""))
+    ok, cam = res["ok"], devices[CAMERA]["on"]
+    cam_txt = "الكاميرا شغالة ✅" if cam else "الكاميرا مطفية ⚠️"
+    log_event("security", "فحص الأمان", f"الباسورد {'صح' if ok else 'غلط'} - {cam_txt}", "يدوي")
+    return {"title": res["message"] + (" 🏠" if ok else " ❌"), "text": cam_txt, "cam_off": not cam}
 
-        def change():
-            try:
-                set_state(AC, True, int(f.value), source="يدوي")
-                snack(ac_file.changed_message(devices[AC]["value"]))
-            except ValueError:
-                snack("اكتبي رقم صح للدرجة", "#B71C1C")
-            refresh_ui()
 
-        def keep():
-            snack(ac_file.keep_message())
+def a_cam(d):
+    set_state(CAMERA, True, source="يدوي")
+    return {"msg": "الكاميرا اشتغلت ✅"}
 
-        def turn_off():
-            set_state(AC, False, source="يدوي")
-            refresh_ui()
 
-        show_dialog("التكييف شغال ❄️",
-                    ft.Column([ft.Text(f"الدرجة دلوقتي {devices[AC]['value']}°C. تحب تغيّرها؟"), f],
-                              tight=True),
-                    [("غيّر", change), ("اطفيه", turn_off), ("زي ما هي", keep)])
+def a_ac_tap(d):
+    set_state(AC, True, source="يدوي")
+    return {"ask_ac": True}
 
-    def apply_climate():
-        if ac_file.decide(env["person"], env["temp"]) == "ON":
-            if not devices[AC]["on"]:
-                set_state(AC, True, source="تلقائي")
-                refresh_ui()
-                ask_ac_temp()
-        elif devices[AC]["on"]:
-            set_state(AC, False, source="تلقائي")
-        refresh_ui()
 
-    def ac_tap():
-        if devices[AC]["on"]:
-            ask_ac_temp()
-        else:
-            set_state(AC, True, source="يدوي")
-            refresh_ui()
-            ask_ac_temp()
+def a_ac_set(d):
+    try:
+        set_state(AC, True, int(d["value"]), source="يدوي")
+        return {"msg": ac_file.changed_message(devices[AC]["value"])}
+    except (ValueError, KeyError, TypeError):
+        return {"msg": "اكتبي رقم صح للدرجة", "err": True}
 
-    # ---------- الحريق ----------
-    def apply_fire():
-        set_state(FIRE, fire_file.is_on("yes" if env["smoke"] else "no", env["temp"]),
-                  source="حساس")
-        refresh_ui()
 
-    def fire_tap():
-        def set_smoke(v):
-            def cb():
-                env["smoke"] = v
-                smoke_sw.value = v
-                apply_fire()
-            return cb
-        show_dialog("فحص الحريق 🔥",
-                    ft.Text(f"فيه دخان؟ (الحرارة الحالية {env['temp']}°C)"),
-                    [("أيوه، فيه دخان", set_smoke(True)), ("لأ", set_smoke(False)), ("إلغاء", None)])
+def a_ac_off(d): set_state(AC, False, source="يدوي")
 
-    # ---------- الباب ----------
-    def door_tap():
-        if not devices[DOOR]["on"]:
-            set_state(DOOR, True, source="يدوي")
-            refresh_ui()
-            return
-        f = ft.TextField(label="who are you? / مين حضرتك؟", autofocus=True)
 
-        def submit():
-            res = door_file.check(f.value, "yes")
-            if res["known"]:
-                who = res["name"]
-                set_state(DOOR, False, source=who)
-                log_event("entry", DOOR, f"{who} دخل البيت", "الباب")
-                snack(" - ".join(res["messages"]) + " 👋")
-            else:
-                who = res["name"]
-                log_event("security", DOOR, f"شخص غريب حاول يدخل (قال إنه: {who or 'مجهول'})", "الباب")
-                snack(res["messages"][0] + " ✋", "#B71C1C")
-            refresh_ui()
+def a_ac_keep(d): return {"msg": ac_file.keep_message()}
 
-        show_dialog("باب الشقة 🚪", f, [("دخول", submit), ("إلغاء", None)])
 
-    # ---------- التلفزيون ----------
-    def tv_tap():
-        if devices[TV]["on"]:
-            set_state(TV, False, source="يدوي")
-            refresh_ui()
-            return
-        f = ft.TextField(label="أي قناة تحب تتفرج عليها؟", autofocus=True)
+def a_door_lock(d): set_state(DOOR, True, source="يدوي")
 
-        def go():
-            ch = f.value.strip() or "1"
-            res = tv_file.turn_on("yes", ch)
-            set_state(TV, True, ch, source="يدوي")
-            snack(" ".join(res["messages"]))
-            refresh_ui()
 
-        show_dialog("تشغيل التلفزيون 📺", f, [("شغّل", go), ("لأ", lambda: snack(tv_file.turn_on("no")["messages"][0]))])
+def a_door_enter(d):
+    res = door_file.check(d.get("name", ""), "yes")
+    who = res["name"]
+    if res["known"]:
+        set_state(DOOR, False, source=who)
+        log_event("entry", DOOR, f"{who} دخل البيت", "الباب")
+        return {"msg": " - ".join(res["messages"]) + " 👋"}
+    log_event("security", DOOR, f"شخص غريب حاول يدخل (قال إنه: {who or 'مجهول'})", "الباب")
+    return {"msg": res["messages"][0] + " ✋", "err": True}
 
-    # ---------- الغسالة ----------
-    def wash_tap():
-        if devices[WASHER]["on"]:
-            set_state(WASHER, False, source="يدوي")
-            refresh_ui()
-            return
-        rg = ft.RadioGroup(
-            value="normal",
-            content=ft.Column([ft.Radio(value="normal", label="عادي (normal)"),
-                               ft.Radio(value="quick", label="سريع (quick)")], tight=True))
 
-        def go():
-            res = wash_file.start("yes", rg.value)
-            set_state(WASHER, True, rg.value, source="يدوي")
-            snack(" - ".join(res["messages"]))
-            refresh_ui()
+def a_tv_off(d): set_state(TV, False, source="يدوي")
 
-        show_dialog("تشغيل الغسالة 🧺", rg, [("شغّل", go), ("إلغاء", None)])
 
-    # ---------- الأنوار ----------
-    def lights_tap():
-        col = ft.Column(tight=True)
+def a_tv_on(d):
+    ch = (d.get("ch") or "").strip() or "1"
+    res = tv_file.turn_on("yes", ch)
+    set_state(TV, True, ch, source="يدوي")
+    return {"msg": " ".join(res["messages"])}
 
-        def make_sw(n):
-            def ch(e):
-                set_state(n, e.control.value, source="يدوي")
-                refresh_ui()
-            return ft.Switch(label=n, value=devices[n]["on"], on_change=ch)
 
+def a_tv_no(d): return {"msg": tv_file.turn_on("no")["messages"][0]}
+
+
+def a_lights_keep(d):
+    if d.get("keep"):
+        return {"msg": "الأنوار فضلت شغالة"} if lights_file.keep("yes") == "ON" else {}
+    if lights_file.keep("no") == "OFF":
         for n in LIGHTS:
-            col.controls.append(make_sw(n))
-        show_dialog("الأنوار 💡", col, [("تمام", None)])
+            set_state(n, False, source="تلقائي")
 
-    # ---------- الأمان ----------
-    def security_tap():
-        pw = ft.TextField(label="Please, enter security password", password=True,
-                          can_reveal_password=True, keyboard_type=ft.KeyboardType.NUMBER,
-                          autofocus=True)
 
-        def submit():
-            res = security_file.check(pw.value)
-            ok = res["ok"]
-            cam_on = devices[CAMERA]["on"]
-            cam_txt = "الكاميرا شغالة ✅" if cam_on else "الكاميرا مطفية ⚠️"
-            log_event("security", "فحص الأمان",
-                      f"الباسورد {'صح' if ok else 'غلط'} - {cam_txt}", "يدوي")
-            buttons = [("تمام", None)]
-            if not cam_on:
-                def cam_start():
-                    set_state(CAMERA, True, source="يدوي")
-                    snack("الكاميرا اشتغلت ✅")
-                    refresh_ui()
-                buttons.insert(0, ("شغّل الكاميرا", cam_start))
-            show_dialog(res["message"] + (" 🏠" if ok else " ❌"),
-                        ft.Text(cam_txt, size=16), buttons)
-
-        show_dialog("فحص الأمان 🔐", pw, [("تأكيد", submit), ("إلغاء", None)])
-
-    # ---------- بناء الشاشة الرئيسية ----------
-    header = ft.Row(
-        [
-            ft.Icon(ft.Icons.HOME_OUTLINED, size=46, color="#E8EEF5"),
-            ft.Column(
-                [ft.Text("SMART HOME", size=26, weight=ft.FontWeight.W_900, color="white"),
-                 ft.Text("INTELLIGENT HOME CONTROL", size=11, weight=ft.FontWeight.BOLD,
-                         color="#9CC3E6")],
-                spacing=0, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            ft.IconButton(ft.Icons.SIGNAL_CELLULAR_ALT_ROUNDED, icon_color=CYAN, icon_size=34,
-                          tooltip="السجل", on_click=show_log),
-        ],
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-    )
-    divider = ft.Container(height=2, bgcolor=CYAN, margin=ft.margin.only(top=6, bottom=6))
-
-    row1 = ft.Row([
-        make_tile("wash", "WASH MACHINE", ft.Icons.LOCAL_LAUNDRY_SERVICE_OUTLINED, C_WASH, wash_tap),
-        make_tile("lights", "LIGHTS", ft.Icons.LIGHTBULB_OUTLINE, C_LIGHTS, lights_tap),
-        make_tile("security", "SECURITY", ft.Icons.SHIELD_OUTLINED, C_SECURITY, security_tap),
-    ], spacing=10)
-    row2 = ft.Row([
-        make_tile("ac", "AIR CONDITIONER", ft.Icons.AC_UNIT, C_AC, ac_tap),
-        make_tile("door", "DOOR ACCESS", ft.Icons.DOOR_FRONT_DOOR_OUTLINED, C_DOOR, door_tap),
-        make_tile("tv", "TELEVISION", ft.Icons.TV, C_TV, tv_tap),
-    ], spacing=10)
-    fire_row = ft.Row([make_tile("fire", "FIRE ALARM", ft.Icons.LOCAL_FIRE_DEPARTMENT_OUTLINED,
-                                 C_FIRE, fire_tap, height=130, wide=True)])
-
-    # ---------- الحساسات (للتجربة) ----------
-    def lights_question():
-        if not any(devices[n]["on"] for n in LIGHTS):
-            return
-
-        def keep():
-            if lights_file.keep("yes") == "ON":
-                snack("الأنوار فضلت شغالة")
-
-        def off():
-            if lights_file.keep("no") == "OFF":
-                for n in LIGHTS:
-                    set_state(n, False, source="تلقائي")
-            refresh_ui()
-
-        show_dialog("الأنوار 💡", ft.Text("مفيش حد في البيت. تحب الأنوار تفضل شغالة؟"),
-                    [("أيوه سيبها", keep), ("لأ، اطفيها", off)])
-
-    def on_person(e):
-        env["person"] = e.control.value
+def a_env(d):
+    out = {}
+    if "person" in d:
+        env["person"] = bool(d["person"])
         if lights_file.decide(env["person"]) == "ON":
             set_state(LIGHTS[0], True, source="تلقائي")
-            refresh_ui()
-            apply_climate()
+            out["ask_ac"] = apply_climate()
         else:
-            apply_climate()
-            lights_question()
-
-    temp_text = ft.Text(f"درجة حرارة البيت: {env['temp']}°C", size=14)
-
-    def on_temp_drag(e):
-        temp_text.value = f"درجة حرارة البيت: {int(e.control.value)}°C"
-        page.update()
-
-    def on_temp_set(e):
-        env["temp"] = int(e.control.value)
-        temp_text.value = f"درجة حرارة البيت: {env['temp']}°C"
+            out["ask_ac"] = apply_climate()
+            out["ask_lights"] = any(devices[n]["on"] for n in LIGHTS)
+    if "temp" in d:
+        env["temp"] = int(d["temp"])
         apply_fire()
-        apply_climate()
-
-    def on_smoke(e):
-        env["smoke"] = e.control.value
+        out["ask_ac"] = apply_climate()
+    if "smoke" in d:
+        env["smoke"] = bool(d["smoke"])
         apply_fire()
-
-    person_sw = ft.Switch(label="👤 فيه حد في البيت", value=env["person"], on_change=on_person)
-    smoke_sw = ft.Switch(label="💨 دخان", value=env["smoke"], on_change=on_smoke)
-    temp_slider = ft.Slider(min=15, max=50, divisions=35, value=env["temp"],
-                            label="{value}°", on_change=on_temp_drag, on_change_end=on_temp_set)
-
-    def sim_entry(e):
-        set_state(DOOR, False, source="حساس")
-        log_event("entry", "حساس الحركة", "شخص دخل البيت", "حساس")
-        refresh_ui()
-
-    def sim_motion(e):
-        log_event("motion", "حساس الحركة", "حركة في الصالة", "حساس")
-        snack("اتسجلت حركة في الصالة")
-
-    sensors = ft.ExpansionTile(
-        title=ft.Text("الحساسات (للتجربة)", size=13, color="#888888"),
-        controls=[
-            person_sw, temp_text, temp_slider, smoke_sw,
-            ft.Row([ft.OutlinedButton("🚪 دخول شخص", on_click=sim_entry),
-                    ft.OutlinedButton("🏃 حركة", on_click=sim_motion)],
-                   wrap=True, alignment=ft.MainAxisAlignment.CENTER),
-        ],
-    )
-
-    # ---------- الشات ----------
-    chat = ft.ListView(height=430, spacing=8, auto_scroll=True)
-
-    def add_msg(text, mine, color=None):
-        t = ft.Text(text, selectable=True, size=15)
-        bubble = ft.Container(content=t, padding=10, border_radius=14,
-                              bgcolor=color or ("#0078D4" if mine else "#2A2A2A"))
-        chat.controls.append(
-            ft.Row([bubble], alignment=ft.MainAxisAlignment.END if mine else ft.MainAxisAlignment.START))
-        page.update()
-        return t
-
-    def alert(msg):
-        add_msg(msg, False, color="#B71C1C")
-        snack(msg, "#B71C1C")
-        refresh_ui()
-
-    hooks["alert"] = alert
-
-    def ask_worker(text, bubble_text):
-        bubble_text.value = ai_file.ask(client_holder["client"], history, text)
-        refresh_ui()
-
-    def send(e):
-        text = inp.value.strip()
-        if not text:
-            return
-        inp.value = ""
-        add_msg(text, True)
-        if client_holder["client"] is None:
-            # من غير API Key: المساعد المحلي يرد على طول
-            add_msg(local_assistant(text), False)
-            refresh_ui()
-            return
-        thinking = add_msg("⏳ بيفكر...", False)
-        threading.Thread(target=ask_worker, args=(text, thinking), daemon=True).start()
-
-    inp = ft.TextField(hint_text="مثال: حد دخل البيت امتى؟ / الكاميرا شغالة؟",
-                       expand=True, on_submit=send, border_radius=20)
-    send_btn = ft.IconButton(ft.Icons.SEND, on_click=send)
-
-    # ---------- التنقل بين الرئيسية والمساعد ----------
-    def show_chat():
-        main_view.visible = False
-        chat_view.visible = True
-        page.update()
-
-    def show_main(e=None):
-        chat_view.visible = False
-        main_view.visible = True
-        refresh_ui()
-
-    ai_bar = make_tile("ai", "AI SMART HOME ASSISTANT", ft.Icons.SMART_TOY_OUTLINED, C_AI,
-                       show_chat, height=80, wide=True)
-    ai_bar.content = ft.Row(
-        [ft.Icon(ft.Icons.SMART_TOY_OUTLINED, size=28, color="white"),
-         ft.Container(width=2, height=24, bgcolor="white"),
-         ft.Text("AI SMART HOME ASSISTANT", size=17, weight=ft.FontWeight.BOLD, color="white"),
-         ft.Icon(ft.Icons.AUTO_AWESOME, size=24, color="white")],
-        alignment=ft.MainAxisAlignment.CENTER, spacing=14)
-
-    main_view = ft.Column(
-        [header, divider, row1, row2, fire_row, ft.Container(height=6), ai_bar, sensors],
-        spacing=14)
-
-    chat_view = ft.Column(
-        [ft.Row([ft.IconButton(ft.Icons.ARROW_BACK, on_click=show_main),
-                 ft.Text("AI SMART HOME ASSISTANT", size=16, weight=ft.FontWeight.BOLD, expand=True),
-                 ft.IconButton(ft.Icons.SETTINGS, on_click=open_settings)]),
-         ft.Container(height=2, bgcolor=CYAN),
-         chat,
-         ft.Row([inp, send_btn])],
-        visible=False, spacing=10)
-
-    root = ft.Container(content=ft.Column([main_view, chat_view]), width=560)
-
-    def fit(e=None):
-        try:
-            root.width = min(page.width or 560, 560)
-            page.update()
-        except Exception:
-            pass
-
-    page.on_resize = fit
-    page.add(root)
-    refresh_ui()
-    fit()
-    add_msg("أهلاً! أنا بيتي 👋 بتحكم في البيت وبسجّل كل اللي بيحصل، اسألني عن أي حاجة.", False)
-
-    key = API_KEY.strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
-        try:
-            key = page.client_storage.get("api_key") or ""
-        except Exception:
-            key = ""
-    if key:
-        set_key(key)
+    return out
 
 
-# ================= يفتح على طول من غير كلمة سر =================
-def main(page: ft.Page):
-    build_app(page)
+def a_sim_entry(d):
+    set_state(DOOR, False, source="حساس")
+    log_event("entry", "حساس الحركة", "شخص دخل البيت", "حساس")
 
 
-# ================= اللينك العام (Cloudflare Tunnel) - للتشغيل على اللاب بس =================
-def _lan_ip():
+def a_sim_motion(d):
+    log_event("motion", "حساس الحركة", "حركة في الصالة", "حساس")
+    return {"msg": "اتسجلت حركة في الصالة"}
+
+
+def a_key(d):
+    if not anthropic:
+        return {"msg": "مكتبة anthropic مش متثبتة", "err": True}
+    set_key(d.get("key", "").strip())
+    if d.get("quiet"):
+        return {}
+    return {"msg": "المفتاح اتحفظ ✅"}
+
+
+def a_chat(d):
+    text = d.get("text", "").strip()
+    if client_holder["client"] is None:
+        return {"reply": local_assistant(text)}
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-
-def _cloudflared_path():
-    """بينزّل cloudflared لوحده أول مرة (من غير حساب ولا توكن)."""
-    import platform
-    import stat
-    import tarfile
-    import urllib.request
-
-    base = os.path.dirname(os.path.abspath(__file__))
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    arch = "arm64" if ("arm" in machine or "aarch64" in machine) else "amd64"
-    root = "https://github.com/cloudflare/cloudflared/releases/latest/download/"
-
-    if system == "windows":
-        path = os.path.join(base, "cloudflared.exe")
-        if not os.path.exists(path):
-            print("بيتنزّل ملف النفق (مرة واحدة بس) ... استني لحظات")
-            urllib.request.urlretrieve(root + f"cloudflared-windows-{arch}.exe", path)
-        return path
-
-    path = os.path.join(base, "cloudflared")
-    if not os.path.exists(path):
-        print("بيتنزّل ملف النفق (مرة واحدة بس) ... استني لحظات")
-        if system == "darwin":
-            tgz = os.path.join(base, "cloudflared.tgz")
-            urllib.request.urlretrieve(root + f"cloudflared-darwin-{arch}.tgz", tgz)
-            with tarfile.open(tgz) as t:
-                t.extract("cloudflared", base)
-            os.remove(tgz)
-        else:
-            urllib.request.urlretrieve(root + f"cloudflared-linux-{arch}", path)
-        os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
-    return path
-
-
-def _start_public_tunnel():
-    import re
-    exe = _cloudflared_path()
-    proc = subprocess.Popen(
-        [exe, "tunnel", "--url", f"http://localhost:{PORT}", "--no-autoupdate"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        encoding="utf-8", errors="ignore")
-
-    def reader():
-        shown = False
-        for line in proc.stdout:
-            m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-            if m and not shown:
-                shown = True
-                print("=" * 50)
-                print(f"🌍 اللينك من أي نت أو داتا:  {m.group(0)}")
-                print("=" * 50)
-
-    threading.Thread(target=reader, daemon=True).start()
-
-
-if IS_CLOUD:
-    # على السيرفر: من غير نفق ومن غير ما يفتح متصفح، واللاب مش لازم يكون شغال
-    print(f"التطبيق شغال على السيرفر - بورت {PORT}")
-    ft.app(target=main, view=None, host="0.0.0.0", port=PORT)
-else:
-    print("=" * 50)
-    print(f"على نفس الواي فاي:  http://{_lan_ip()}:{PORT}")
-    try:
-        _start_public_tunnel()
+        return {"reply": ai_file.ask(client_holder["client"], histories.setdefault(d.get("sid", "x"), []), text)}
     except Exception as ex:
-        print(f"النفق ما اشتغلش: {ex}")
-    print("استني ثواني لحد ما يظهر اللينك العام (🌍) تحت...")
-    print("=" * 50)
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER)
+        return {"reply": f"حصل خطأ: {ex}"}
+
+
+ACTIONS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("a_") and callable(v)}
+
+
+@app.post("/api/<name>")
+def api(name):
+    fn = ACTIONS.get(name)
+    if not fn:
+        return jsonify(error="unknown"), 404
+    return snapshot(**(fn(request.get_json(silent=True) or {}) or {}))
+
+
+@app.get("/api/state")
+def api_state():
+    return snapshot()
+
+
+@app.get("/api/log")
+def api_log():
+    return jsonify(events=list(reversed(events[-60:])))
+
+
+@app.get("/")
+def index():
+    return Response(PAGE, mimetype="text/html")
+
+
+PAGE = r"""<!doctype html><html lang="ar"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Home Intelligent Home Control</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons+Outlined">
+<style>
+[hidden]{display:none!important}
+body{margin:0;background:#030308;color:#fff;font-family:system-ui,Segoe UI,Tahoma,sans-serif;display:flex;justify-content:center}
+#root{width:100%;max-width:560px;padding:16px;box-sizing:border-box}
+.mi{font-family:'Material Icons Outlined';font-size:44px;font-weight:normal;font-style:normal;line-height:1;-webkit-font-feature-settings:'liga';font-feature-settings:'liga'}
+.row{display:flex;gap:10px;margin-bottom:14px}
+.tile{flex:1;height:120px;border-radius:26px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;cursor:pointer;text-align:center;user-select:none}
+.tile b{font-size:13px}.tile small{font-size:11px;color:#FFFFFFCC;min-height:13px}
+.wide{height:130px;flex-direction:row;gap:18px}.wide b{font-size:20px;display:block}
+button{background:none;border:0;color:#22D3EE;font-size:15px;cursor:pointer;padding:8px 12px}
+input[type=text],input[type=password],input[type=number]{width:100%;box-sizing:border-box;padding:10px;margin-top:8px;background:#111;color:#fff;border:1px solid #555;border-radius:8px;font-size:15px}
+.ov{position:fixed;inset:0;background:#000A;display:flex;align-items:center;justify-content:center;z-index:9}
+.dl{background:#1E1E1E;border-radius:20px;padding:20px;min-width:280px;max-width:90vw}.dl h3{margin:0 0 12px}
+.ac{display:flex;justify-content:flex-end;flex-wrap:wrap;margin-top:12px}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#333;padding:12px 18px;border-radius:10px;z-index:10;max-width:90vw}
+.mr{display:flex;margin:4px 0}.bb{padding:10px;border-radius:14px;max-width:85%;white-space:pre-wrap;font-size:15px}
+#chat{height:430px;overflow:auto}summary{color:#888;font-size:13px;cursor:pointer;margin:6px 0}
+details label{display:block;margin:10px 0}
+</style></head><body><div id="root">
+<div id="main">
+<div style="display:flex;justify-content:space-between;align-items:center">
+ <i class="mi" style="font-size:46px;color:#E8EEF5">home</i>
+ <div style="text-align:center"><div style="font-size:26px;font-weight:900">SMART HOME</div><div style="font-size:11px;font-weight:bold;color:#9CC3E6">INTELLIGENT HOME CONTROL</div></div>
+ <button onclick="showLog()" title="السجل"><i class="mi" style="font-size:34px;color:#22D3EE">signal_cellular_alt</i></button></div>
+<div style="height:2px;background:#22D3EE;margin:12px 0"></div>
+<div class="row">
+ <div class="tile" id="t-wash" style="background:#0099FF" onclick="wash()"><i class="mi">local_laundry_service</i><b>WASH MACHINE</b><small id="s-wash"></small></div>
+ <div class="tile" id="t-lights" style="background:#E6B800" onclick="lights()"><i class="mi">lightbulb</i><b>LIGHTS</b><small id="s-lights"></small></div>
+ <div class="tile" id="t-security" style="background:#00CC44" onclick="sec()"><i class="mi">shield</i><b>SECURITY</b><small id="s-security"></small></div></div>
+<div class="row">
+ <div class="tile" id="t-ac" style="background:#00B3B3" onclick="ac()"><i class="mi">ac_unit</i><b>AIR CONDITIONER</b><small id="s-ac"></small></div>
+ <div class="tile" id="t-door" style="background:#E65C00" onclick="door()"><i class="mi">door_front_door</i><b>DOOR ACCESS</b><small id="s-door"></small></div>
+ <div class="tile" id="t-tv" style="background:#9900CC" onclick="tv()"><i class="mi">tv</i><b>TELEVISION</b><small id="s-tv"></small></div></div>
+<div class="row"><div class="tile wide" id="t-fire" style="background:#CC0029" onclick="fire()"><i class="mi">local_fire_department</i><div><b>FIRE ALARM</b><small id="s-fire"></small></div></div></div>
+<div class="row" style="margin-top:6px"><div class="tile wide" style="background:#4B0082;height:80px;gap:14px" onclick="view(1)">
+ <i class="mi" style="font-size:28px">smart_toy</i><span style="width:2px;height:24px;background:#fff"></span><b style="font-size:17px">AI SMART HOME ASSISTANT</b><i class="mi" style="font-size:24px">auto_awesome</i></div></div>
+<details><summary>الحساسات (للتجربة)</summary>
+ <label><input type="checkbox" id="person" onchange="api('env',{person:this.checked})"> 👤 فيه حد في البيت</label>
+ <div id="tt" style="font-size:14px"></div>
+ <input type="range" id="temp" min="15" max="50" style="width:100%" oninput="tt.textContent='درجة حرارة البيت: '+this.value+'°C'" onchange="api('env',{temp:+this.value})">
+ <label><input type="checkbox" id="smoke" onchange="api('env',{smoke:this.checked})"> 💨 دخان</label>
+ <div style="text-align:center"><button onclick="api('sim_entry',{})">🚪 دخول شخص</button><button onclick="api('sim_motion',{})">🏃 حركة</button></div></details>
+</div>
+<div id="chatv" hidden>
+ <div style="display:flex;align-items:center"><button onclick="view(0)"><i class="mi" style="font-size:24px;color:#fff">arrow_back</i></button>
+ <b style="flex:1">AI SMART HOME ASSISTANT</b><button onclick="settings()"><i class="mi" style="font-size:24px;color:#fff">settings</i></button></div>
+ <div style="height:2px;background:#22D3EE;margin:10px 0"></div><div id="chat"></div>
+ <div style="display:flex;gap:6px;margin-top:10px"><input type="text" id="msg" style="margin:0;border-radius:20px" placeholder="مثال: حد دخل البيت امتى؟ / الكاميرا شغالة؟" onkeydown="if(event.key=='Enter')send()">
+ <button onclick="send()"><i class="mi" style="font-size:24px">send</i></button></div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s),sid=Math.random().toString(36).slice(2);let S=null,first=1;
+const el=h=>{const d=document.createElement('div');d.innerHTML=h;return d};
+function inp(type,ph){const i=document.createElement('input');i.type=type;i.placeholder=ph;return i}
+async function api(n,b){const r=await fetch('/api/'+n,{method:b===undefined?'GET':'POST',headers:{'Content-Type':'application/json'},body:b===undefined?undefined:JSON.stringify(b)});const j=await r.json();render(j);return j}
+function render(j){
+ if(j.tiles){S=j;for(const k in j.tiles)$('#s-'+k).textContent=j.tiles[k];
+  $('#t-security').style.background=j.cam?'#00CC44':'#E65100';$('#t-fire').style.outline=j.fire?'3px solid #fff':'none';
+  if(first){first=0;$('#person').checked=j.env.person;$('#smoke').checked=j.env.smoke;$('#temp').value=j.env.temp;tt.textContent='درجة حرارة البيت: '+j.env.temp+'°C'}}
+ (j.alerts||[]).forEach(m=>{addMsg(m,0,'#B71C1C');toast(m,'#B71C1C')});
+ if(j.msg)toast(j.msg,j.err?'#B71C1C':null);
+ if(j.ask_ac)askAC();if(j.ask_lights)askLights()}
+function toast(m,c){const t=el('');t.className='toast';t.textContent=m;if(c)t.style.background=c;document.body.append(t);setTimeout(()=>t.remove(),3500)}
+const Q=[];let busy=false;
+function dlg(t,body,btns){Q.push([t,body,btns]);if(!busy)nxt()}
+function nxt(){const x=Q.shift();if(!x){busy=false;return}busy=true;
+ const o=el(''),d=el(''),h=document.createElement('h3'),a=el('');o.className='ov';d.className='dl';a.className='ac';h.textContent=x[0];d.append(h);
+ d.append(typeof x[1]=='string'?document.createTextNode(x[1]):x[1]);
+ x[2].forEach(([l,cb])=>{const b=document.createElement('button');b.textContent=l;b.onclick=()=>{o.remove();cb&&cb();nxt()};a.append(b)});
+ d.append(a);o.append(d);document.body.append(o);const f=d.querySelector('input[type=text],input[type=password],input[type=number]');f&&f.focus()}
+function wash(){if(S.on.wash)return api('wash_off',{});
+ const b=el('<label><input type="radio" name="w" value="normal" checked> عادي (normal)</label><br><label><input type="radio" name="w" value="quick"> سريع (quick)</label>');
+ dlg('تشغيل الغسالة 🧺',b,[['شغّل',()=>api('wash_on',{type:b.querySelector('input:checked').value})],['إلغاء']])}
+function lights(){const b=el('');for(const n in S.lights){const l=document.createElement('label');l.style.display='block';l.style.margin='8px 0';l.innerHTML='<input type="checkbox"> '+n;const c=l.firstChild;c.checked=S.lights[n];c.onchange=()=>api('light',{name:n,on:c.checked});b.append(l)}dlg('الأنوار 💡',b,[['تمام']])}
+function sec(){const i=inp('password','Please, enter security password');i.inputMode='numeric';
+ dlg('فحص الأمان 🔐',i,[['تأكيد',async()=>{const r=await api('sec',{pw:i.value});const bt=[['تمام']];if(r.cam_off)bt.unshift(['شغّل الكاميرا',()=>api('cam',{})]);dlg(r.title,r.text,bt)}],['إلغاء']])}
+function ac(){S.on.ac?askAC():api('ac_tap',{})}
+function askAC(){const i=inp('number','الدرجة الجديدة');i.value=S.ac_value;const b=el('<p>الدرجة دلوقتي '+S.ac_value+'°C. تحب تغيّرها؟</p>');b.append(i);
+ dlg('التكييف شغال ❄️',b,[['غيّر',()=>api('ac_set',{value:i.value})],['اطفيه',()=>api('ac_off',{})],['زي ما هي',()=>api('ac_keep',{})]])}
+function door(){if(!S.on.door)return api('door_lock',{});const i=inp('text','who are you? / مين حضرتك؟');
+ dlg('باب الشقة 🚪',i,[['دخول',()=>api('door_enter',{name:i.value})],['إلغاء']])}
+function tv(){if(S.on.tv)return api('tv_off',{});const i=inp('text','أي قناة تحب تتفرج عليها؟');
+ dlg('تشغيل التلفزيون 📺',i,[['شغّل',()=>api('tv_on',{ch:i.value})],['لأ',()=>api('tv_no',{})]])}
+function fire(){const s=v=>()=>{$('#smoke').checked=v;api('env',{smoke:v})};
+ dlg('فحص الحريق 🔥','فيه دخان؟ (الحرارة الحالية '+S.env.temp+'°C)',[['أيوه، فيه دخان',s(true)],['لأ',s(false)],['إلغاء']])}
+function askLights(){dlg('الأنوار 💡','مفيش حد في البيت. تحب الأنوار تفضل شغالة؟',[['أيوه سيبها',()=>api('lights_keep',{keep:true})],['لأ، اطفيها',()=>api('lights_keep',{keep:false})]])}
+async function showLog(){const r=await api('log');const ic={entry:'🚪',fire_alarm:'🔥',motion:'🏃',security:'🔐'},b=el('');b.style.cssText='max-height:380px;overflow:auto';
+ r.events.forEach(e=>{const d=el('');d.style.cssText='font-size:13px;margin:6px 0;white-space:pre-line';d.textContent=(ic[e.kind]||'🔧')+' '+e.time+'\n'+e.device+': '+e.detail+'  ('+e.source+')';b.append(d)});
+ if(!r.events.length)b.textContent='السجل فاضي لسه';dlg('سجل أحداث البيت',b,[['إغلاق']])}
+function view(c){$('#main').hidden=!!c;$('#chatv').hidden=!c}
+function addMsg(t,mine,c){const r=el(''),b=el('');r.className='mr';r.style.justifyContent=mine?'flex-end':'flex-start';b.className='bb';b.style.background=c||(mine?'#0078D4':'#2A2A2A');b.textContent=t;r.append(b);$('#chat').append(r);$('#chat').scrollTop=1e9;return b}
+async function send(){const i=$('#msg'),t=i.value.trim();if(!t)return;i.value='';addMsg(t,1);const b=addMsg('⏳ بيفكر...',0);const r=await api('chat',{text:t,sid});b.textContent=r.reply}
+function settings(){const i=inp('password','Anthropic API Key');dlg('إعدادات الـ AI',i,[['حفظ',()=>{const k=i.value.trim();if(k){try{localStorage.k=k}catch(e){}api('key',{key:k})}}]])}
+addMsg('أهلاً! أنا بيتي 👋 بتحكم في البيت وبسجّل كل اللي بيحصل، اسألني عن أي حاجة.',0);
+api('state');setInterval(()=>api('state'),5000);
+try{if(localStorage.k)api('key',{key:localStorage.k,quiet:1})}catch(e){}
+</script></body></html>"""
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)

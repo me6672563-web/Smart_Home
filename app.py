@@ -1,3 +1,15 @@
+"""
+Smart Home + AI Assistant (v4) - الواجهة الجديدة (كروت ملونة)
+بيشتغل على سيرفر أونلاين (Render مثلاً) من أي نت (داتا / واي فاي تاني) من غير ما اللاب يكون شغال.
+وبيشتغل كمان على اللاب عن طريق Cloudflare Tunnel.
+والشات بيشتغل من غير API Key بمساعد محلي، ولو حطيتي مفتاح بيستخدم الـ AI.
+
+الملفات اللي لازم تكون في نفس الفولدر مع app.py (ملفاتك أنتِ، والتطبيق بيستدعيها):
+  air_conditioner.py  door.py  fire_alarm.py  TV.py  wash_machine.py  lights.py  Security.py  ai_assistant.py
+
+التشغيل:
+  python app.py
+"""
 
 import json
 import os
@@ -847,4 +859,4 @@ else:
         print(f"النفق ما اشتغلش: {ex}")
     print("استني ثواني لحد ما يظهر اللينك العام (🌍) تحت...")
     print("=" * 50)
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, host="0.0.0.0", port=PORT)
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=PORT)

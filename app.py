@@ -5,28 +5,15 @@ from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, Response
 
 
-try:
-    import anthropic
-except ImportError:
-    anthropic = None
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import air_conditioner as ac_file
 import door as door_file
 import fire_alarm as fire_file
-import TV as tv_file
+import tv as tv_file
 import wash_machine as wash_file
 import lights as lights_file
-import Security as security_file
-import ai_assistant as ai_file         
+import security as security_file
 
-# >>> سيبيها فاضية لو مش عايزة AI (المساعد المحلي هيشتغل). أو حطي المفتاح هنا <<<
-API_KEY = ""
-
-# لو التطبيق شغال على سيرفر (Render / Railway / ...) السيرفر بيحدد البورت لوحده،
-# وساعتها مش محتاجين نفق Cloudflare ولا اللاب يكون شغال.
-IS_CLOUD = bool(os.environ.get("PORT")) or os.environ.get("RUN_ON_SERVER") == "1"
-PORT = int(os.environ.get("PORT", 5050))
 KNOWN_PEOPLE = door_file.person          # من door.py
 AC_ON_TEMP = ac_file.ON_TEMP             # من air_conditioner.py
 FIRE_TEMP = fire_file.TEMP_LIMIT         # من fire_alarm.py
@@ -140,11 +127,7 @@ def query_events(device=None, kind=None, hours=None, limit=20):
     }
 
 
-# ---------------- المساعد الذكي: بيجي من ai_assistant.py ----------------
-ai_file.bind(devices, set_state, state_text, query_events, env)
-
-
-# ---------------- مساعد محلي (من غير AI ومن غير API Key) ----------------
+# ---------------- المساعد (محلي - من غير AI ومن غير API Key) ----------------
 import re as _re
 
 
@@ -254,19 +237,9 @@ def local_assistant(text):
 
 # ================= Flask =================
 app = Flask(__name__)
-client_holder = {"client": None}
-histories = {}
 pending = []                      # تنبيهات (حريق / كاميرا) بتتبعت للصفحة
 hooks["alert"] = pending.append
 load_events()
-
-
-def set_key(k):
-    if anthropic and k:
-        client_holder["client"] = anthropic.Anthropic(api_key=k)
-
-
-set_key(API_KEY.strip() or os.environ.get("ANTHROPIC_API_KEY", "").strip())
 
 
 def apply_fire():
@@ -333,6 +306,8 @@ def a_ac_tap(d):
 
 def a_ac_set(d):
     try:
+        if int(d["value"]) > ac_file.MAX_TEMP:
+            return {"msg": ac_file.too_high_message(), "err": True}
         set_state(AC, True, int(d["value"]), source="يدوي")
         return {"msg": ac_file.changed_message(devices[AC]["value"])}
     except (ValueError, KeyError, TypeError):
@@ -363,7 +338,9 @@ def a_tv_off(d): set_state(TV, False, source="يدوي")
 
 
 def a_tv_on(d):
-    ch = (d.get("ch") or "").strip() or "1"
+    ch = (d.get("ch") or "").strip().lower()
+    if ch not in tv_file.CHANNELS:
+        return {"msg": tv_file.channel_not_found_message() + " (" + ", ".join(tv_file.CHANNELS) + ")", "err": True}
     res = tv_file.turn_on("yes", ch)
     set_state(TV, True, ch, source="يدوي")
     return {"msg": " ".join(res["messages"])}
@@ -410,23 +387,8 @@ def a_sim_motion(d):
     return {"msg": "اتسجلت حركة في الصالة"}
 
 
-def a_key(d):
-    if not anthropic:
-        return {"msg": "مكتبة anthropic مش متثبتة", "err": True}
-    set_key(d.get("key", "").strip())
-    if d.get("quiet"):
-        return {}
-    return {"msg": "المفتاح اتحفظ ✅"}
-
-
 def a_chat(d):
-    text = d.get("text", "").strip()
-    if client_holder["client"] is None:
-        return {"reply": local_assistant(text)}
-    try:
-        return {"reply": ai_file.ask(client_holder["client"], histories.setdefault(d.get("sid", "x"), []), text)}
-    except Exception as ex:
-        return {"reply": f"حصل خطأ: {ex}"}
+    return {"reply": local_assistant(d.get("text", "").strip())}
 
 
 ACTIONS = {k[2:]: v for k, v in list(globals().items()) if k.startswith("a_") and callable(v)}
@@ -504,7 +466,7 @@ details label{display:block;margin:10px 0}
 </div>
 <div id="chatv" hidden>
  <div style="display:flex;align-items:center"><button onclick="view(0)"><i class="mi" style="font-size:24px;color:#fff">arrow_back</i></button>
- <b style="flex:1">AI SMART HOME ASSISTANT</b><button onclick="settings()"><i class="mi" style="font-size:24px;color:#fff">settings</i></button></div>
+ <b style="flex:1">AI SMART HOME ASSISTANT</b></div>
  <div style="height:2px;background:#22D3EE;margin:10px 0"></div><div id="chat"></div>
  <div style="display:flex;gap:6px;margin-top:10px"><input type="text" id="msg" style="margin:0;border-radius:20px" placeholder="مثال: حد دخل البيت امتى؟ / الكاميرا شغالة؟" onkeydown="if(event.key=='Enter')send()">
  <button onclick="send()"><i class="mi" style="font-size:24px">send</i></button></div></div>
@@ -551,12 +513,10 @@ async function showLog(){const r=await api('log');const ic={entry:'🚪',fire_al
 function view(c){$('#main').hidden=!!c;$('#chatv').hidden=!c}
 function addMsg(t,mine,c){const r=el(''),b=el('');r.className='mr';r.style.justifyContent=mine?'flex-end':'flex-start';b.className='bb';b.style.background=c||(mine?'#0078D4':'#2A2A2A');b.textContent=t;r.append(b);$('#chat').append(r);$('#chat').scrollTop=1e9;return b}
 async function send(){const i=$('#msg'),t=i.value.trim();if(!t)return;i.value='';addMsg(t,1);const b=addMsg('⏳ بيفكر...',0);const r=await api('chat',{text:t,sid});b.textContent=r.reply}
-function settings(){const i=inp('password','Anthropic API Key');dlg('إعدادات الـ AI',i,[['حفظ',()=>{const k=i.value.trim();if(k){try{localStorage.k=k}catch(e){}api('key',{key:k})}}]])}
 addMsg('أهلاً! أنا بيتي 👋 بتحكم في البيت وبسجّل كل اللي بيحصل، اسألني عن أي حاجة.',0);
 api('state');setInterval(()=>api('state'),5000);
-try{if(localStorage.k)api('key',{key:localStorage.k,quiet:1})}catch(e){}
 </script></body></html>"""
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+if __name__ == "__main__":      # للتجربة على جهازك بس - على PythonAnywhere بيتجاهلها
+    app.run()

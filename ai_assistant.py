@@ -141,5 +141,5 @@ def ask(client, history, text):
             else:
                 return "".join(b.text for b in resp.content if b.type == "text")
     except Exception as ex:
-        del history[start:]   # يشيل الرسالة وأي أدوات ناقصة عشان المحادثة ما تبوظش
+        del history[start:]  
         return f"حصل خطأ في الاتصال:\n{ex}"

@@ -27,6 +27,16 @@ def ask_channel():
         print("Available channels:", ", ".join(CHANNELS))
 
 
+def change_volume(current, new):
+    try:
+        new = int(new)
+    except (ValueError, TypeError):
+        return {"ok": False, "volume": current, "message": "Please enter a valid integer"}
+    if new < 0 or new > MAX_VOLUME:
+        return {"ok": False, "volume": current, "message": f"Volume must be between 0 and {MAX_VOLUME}"}
+    return {"ok": True, "volume": new, "message": volume_message(current, new)}
+
+
 def ask_volume(current):
     ask = input("Do you want to change the volume? (yes/no): ")
     if ask.lower() != "yes":
@@ -34,17 +44,10 @@ def ask_volume(current):
 
     print(f"Current volume is {current}")
     while True:
-        try:
-            new_volume = int(input(f"Enter the new volume (0-{MAX_VOLUME}): "))
-        except ValueError:
-            print("Please enter a valid integer")
-            continue
-
-        if new_volume < 0 or new_volume > MAX_VOLUME:
-            print(f"Volume must be between 0 and {MAX_VOLUME}")
-        else:
-            print(volume_message(current, new_volume))
-            return new_volume
+        res = change_volume(current, input(f"Enter the new volume (0-{MAX_VOLUME}): "))
+        print(res["message"])
+        if res["ok"]:
+            return res["volume"]
 
 
 if __name__ == "__main__":

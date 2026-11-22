@@ -1,15 +1,9 @@
-"""
-Smart Home + AI Assistant - نسخة Flask لـ PythonAnywhere (نفس منطق app.py ونفس ملفاتك).
-الملفات اللي لازم تكون جنب الملف ده: air_conditioner.py door.py fire_alarm.py TV.py
-wash_machine.py lights.py Security.py ai_assistant.py
-"""
-
 import json
 import os
 import sys
 from datetime import datetime, timedelta
-
 from flask import Flask, jsonify, request, Response
+
 
 try:
     import anthropic
@@ -24,7 +18,7 @@ import TV as tv_file
 import wash_machine as wash_file
 import lights as lights_file
 import Security as security_file
-import ai_assistant as ai_file          # المساعد الذكي بتاعك
+import ai_assistant as ai_file         
 
 # >>> سيبيها فاضية لو مش عايزة AI (المساعد المحلي هيشتغل). أو حطي المفتاح هنا <<<
 API_KEY = ""
